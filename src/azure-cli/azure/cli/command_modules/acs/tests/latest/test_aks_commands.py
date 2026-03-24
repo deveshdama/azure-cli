@@ -5,6 +5,7 @@
 
 import json
 import os
+import random
 import subprocess
 import tempfile
 import time
@@ -49,6 +50,138 @@ class AzureKubernetesServiceScenarioTest(ScenarioTest):
         super(AzureKubernetesServiceScenarioTest, self).__init__(
             method_name, recording_processors=[KeyReplacer()]
         )
+
+    def cmd(self, command, checks=None, expect_failure=False):
+        """
+        Override cmd to add provisioningState retry logic for AKS tests.
+
+        When AZURE_CLI_TEST_RETRY_PROVISIONING_CHECK=true and running in live mode,
+        this uses a two-phase check approach to handle race conditions where Azure
+        Policy or other external actors modify resources between command completion
+        and test assertion.
+
+        Phase 1: Validate provisioningState == Succeeded. If not, poll the resource
+        via 'az resource show --ids' with exponential backoff until it reaches a
+        terminal state (Succeeded, Failed, or Canceled).
+
+        Phase 2: Validate all remaining checks against the original command result,
+        ensuring the operation itself produced correct output.
+        """
+        if (checks and self.is_live and
+            os.environ.get('AZURE_CLI_TEST_RETRY_PROVISIONING_CHECK') == 'true'):
+            return self._cmd_with_retry(command, checks, expect_failure)
+
+        return super().cmd(command, checks=checks, expect_failure=expect_failure)
+
+    def _is_provisioning_state_check(self, check):
+        """Check if a JMESPathCheck is for provisioningState == Succeeded."""
+        from azure.cli.testsdk.checkers import JMESPathCheck
+        if not isinstance(check, JMESPathCheck):
+            return False
+        return (check.query == 'provisioningState' and
+                check.expected_result == 'Succeeded')
+
+    def _should_retry_for_provisioning_state(self, result):
+        """
+        Determine if we should poll for provisioningState recovery.
+        Returns: (should_retry: bool, resource_id: str|None)
+
+        Only retry if:
+        - result has 'id' field (ARM resource)
+        - provisioningState exists and != Succeeded
+        - provisioningState is not terminal (Failed/Canceled)
+        """
+        if not hasattr(result, 'get_output_in_json'):
+            return False, None
+
+        data = result.get_output_in_json()
+        if not isinstance(data, dict) or 'id' not in data:
+            return False, None
+
+        provisioning_state = data.get('provisioningState')
+        if not provisioning_state:
+            return False, None
+
+        # Don't retry if already succeeded or in terminal failure state
+        terminal_states = {'Succeeded', 'Failed', 'Canceled'}
+        if provisioning_state in terminal_states:
+            return False, None
+
+        return True, data['id']
+
+    def _cmd_with_retry(self, command, checks, expect_failure):
+        """
+        Execute command with two-phase check validation.
+        Phase 1: Validate provisioningState == Succeeded, retrying with poll if needed.
+        Phase 2: Validate all remaining checks on the original result.
+        Uses etag to detect external modifications (e.g. Azure Policy).
+        """
+        from azure.cli.testsdk import execute
+        import logging
+
+        # Execute the command
+        result = execute(self.cli_ctx, command, expect_failure=expect_failure)
+
+        # Separate checks into provisioningState and other checks
+        provisioning_checks = [c for c in (checks or []) if self._is_provisioning_state_check(c)]
+        other_checks = [c for c in (checks or []) if not self._is_provisioning_state_check(c)]
+
+        # Phase 1: Handle provisioningState with retry
+        if provisioning_checks:
+            should_retry, resource_id = self._should_retry_for_provisioning_state(result)
+
+            if should_retry:
+                # Get initial etag for tracking external modifications
+                initial_data = result.get_output_in_json()
+                initial_etag = initial_data.get('etag')
+                last_seen_etag = initial_etag
+
+                # Poll until provisioningState becomes terminal
+                max_retries = int(os.environ.get('AZURE_CLI_TEST_PROVISIONING_MAX_RETRIES', '10'))
+                base_delay = float(os.environ.get('AZURE_CLI_TEST_PROVISIONING_BASE_DELAY', '2.0'))
+
+                for attempt in range(max_retries):
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(delay)
+
+                    # Poll the resource
+                    poll_result = execute(self.cli_ctx, f'resource show --ids {resource_id}', expect_failure=False)
+                    poll_data = poll_result.get_output_in_json()
+
+                    current_provisioning_state = poll_data.get('provisioningState')
+                    current_etag = poll_data.get('etag')
+
+                    # Check for external modifications via etag
+                    if current_etag and last_seen_etag and current_etag != last_seen_etag:
+                        logging.warning(f"ETag changed during polling (external modification detected)")
+                    last_seen_etag = current_etag
+
+                    # Check if we've reached a terminal state
+                    if current_provisioning_state == 'Succeeded':
+                        break
+                    elif current_provisioning_state in {'Failed', 'Canceled'}:
+                        raise AssertionError(
+                            f"provisioningState reached terminal failure: {current_provisioning_state}"
+                        )
+                else:
+                    # Timeout - max retries exhausted
+                    final_etag_msg = ""
+                    if initial_etag and last_seen_etag:
+                        final_etag_msg = f" (initial etag: {initial_etag}, final: {last_seen_etag})"
+                    raise TimeoutError(
+                        f"provisioningState did not reach 'Succeeded' after {max_retries} retries. "
+                        f"Final state: {current_provisioning_state}{final_etag_msg}"
+                    )
+
+            # Validate provisioningState on original result
+            for check in provisioning_checks:
+                check.compare(result)
+
+        # Phase 2: Validate all other checks on original result
+        for check in other_checks:
+            check.compare(result)
+
+        return result
 
     @classmethod
     def generate_ssh_keys(cls):
